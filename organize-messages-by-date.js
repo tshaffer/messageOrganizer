@@ -5,8 +5,9 @@
  * Recursively scans a Messages Attachments folder, reads each media file's
  * actual capture date (from EXIF/QuickTime metadata via exiftool, falling
  * back to the file's filesystem date when no metadata date exists), and
- * copies it into <dest>/<year>/<filename>. Originals are left untouched -
- * this only ever copies, never deletes or moves the source.
+ * copies it into <dest>/<year><month>/<filename> (e.g. 202609/IMG_1234.jpg
+ * for a September 2026 photo). Originals are left untouched - this only
+ * ever copies, never deletes or moves the source.
  *
  * Setup (once, in whatever folder you keep this script):
  *   npm install exiftool-vendored
@@ -24,8 +25,8 @@
  *   - "Media files" = common image/video extensions (see MEDIA_EXTENSIONS
  *     below). Everything else under the source folder (PDFs, voice messages,
  *     contact cards, stickers, etc.) is left in place and just counted.
- *   - If two source files would land on the same <year>/<filename>, the
- *     live run auto-renames with -1, -2, ... suffixes rather than
+ *   - If two source files would land on the same <year><month>/<filename>,
+ *     the live run auto-renames with -1, -2, ... suffixes rather than
  *     overwriting or skipping anything. The dry run reports these up front.
  *   - Video capture dates occasionally come from a UTC timestamp in the
  *     file's metadata rather than local time, which can very rarely push a
@@ -103,7 +104,12 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
  
-async function getYearForFile(exiftool, filePath) {
+// Folder name for a given year/month, e.g. (2026, 9) -> "202609".
+function periodFolderName(year, month) {
+  return `${year}${String(month).padStart(2, '0')}`;
+}
+ 
+async function getDateInfoForFile(exiftool, filePath) {
   try {
     const tags = await exiftool.read(filePath);
     // Prefer the actual capture date. DateTimeOriginal is the standard EXIF
@@ -116,8 +122,8 @@ async function getYearForFile(exiftool, filePath) {
       tags.CreateDate ||
       tags.MediaCreateDate ||
       tags.TrackCreateDate;
-    if (candidate && typeof candidate.year === 'number') {
-      return { year: candidate.year, dateSource: 'metadata' };
+    if (candidate && typeof candidate.year === 'number' && typeof candidate.month === 'number') {
+      return { year: candidate.year, month: candidate.month, dateSource: 'metadata' };
     }
   } catch (err) {
     // fall through to filesystem date
@@ -125,9 +131,13 @@ async function getYearForFile(exiftool, filePath) {
   try {
     const stat = await fsp.stat(filePath);
     const fsDate = stat.birthtime && stat.birthtime.getTime() > 0 ? stat.birthtime : stat.mtime;
-    return { year: fsDate.getFullYear(), dateSource: 'filesystem (no metadata date found)' };
+    return {
+      year: fsDate.getFullYear(),
+      month: fsDate.getMonth() + 1, // Date.getMonth() is 0-based
+      dateSource: 'filesystem (no metadata date found)',
+    };
   } catch (err) {
-    return { year: null, dateSource: `unreadable: ${err.message}` };
+    return { year: null, month: null, dateSource: `unreadable: ${err.message}` };
   }
 }
  
@@ -166,8 +176,16 @@ async function main() {
   console.log(`Found ${allFiles.length} total files under source.`);
  
   const mediaFiles = allFiles.filter((f) => MEDIA_EXTENSIONS.has(path.extname(f).toLowerCase()));
-  const nonMediaCount = allFiles.length - mediaFiles.length;
-  console.log(`${mediaFiles.length} are images/videos; ${nonMediaCount} other files will be left in place.\n`);
+  const nonMediaFiles = allFiles.filter((f) => !MEDIA_EXTENSIONS.has(path.extname(f).toLowerCase()));
+  const nonMediaCount = nonMediaFiles.length;
+  console.log(`${mediaFiles.length} are images/videos; ${nonMediaCount} other files will be left in place.`);
+ 
+  if (nonMediaCount > 0) {
+    const previewCount = Math.min(50, nonMediaCount);
+    console.log(`\nFirst ${previewCount} non-media file(s) (left in place, not copied):`);
+    for (const f of nonMediaFiles.slice(0, previewCount)) console.log(`  ${f}`);
+  }
+  console.log('');
  
   const exiftool = new ExifTool({
     taskTimeoutMillis: 15000,
@@ -177,7 +195,7 @@ async function main() {
   console.log('Reading capture dates (this is the slow part)...');
   let readCount = 0;
   const dated = await mapWithConcurrency(mediaFiles, concurrency, async (filePath) => {
-    const result = await getYearForFile(exiftool, filePath);
+    const result = await getDateInfoForFile(exiftool, filePath);
     readCount += 1;
     if (readCount % 250 === 0) console.log(`  ...read ${readCount}/${mediaFiles.length}`);
     return { filePath, ...result };
@@ -189,12 +207,12 @@ async function main() {
   const usable = dated.filter((d) => d.year !== null);
  
   // Group by intended (pre-suffix) destination path so we can spot
-  // duplicate filenames that would land in the same year folder.
+  // duplicate filenames that would land in the same year+month folder.
   const byNaiveDest = new Map(); // naiveDestPath -> [{filePath, dateSource}]
   for (const item of usable) {
-    const yearDir = path.join(dest, String(item.year));
+    const periodDir = path.join(dest, periodFolderName(item.year, item.month));
     const filename = path.basename(item.filePath);
-    const naiveDestPath = path.join(yearDir, filename);
+    const naiveDestPath = path.join(periodDir, filename);
     if (!byNaiveDest.has(naiveDestPath)) byNaiveDest.set(naiveDestPath, []);
     byNaiveDest.get(naiveDestPath).push(item);
   }
@@ -203,14 +221,14 @@ async function main() {
   // Check which naive destination names already exist on disk (e.g. from a
   // previous run of this script). Informational only - the live run
   // handles these safely either way by auto-renaming.
-  const existingNamesByYear = new Map();
+  const existingNamesByPeriod = new Map();
   const alreadyOnDisk = [];
   for (const [naiveDestPath, items] of byNaiveDest.entries()) {
-    const year = path.basename(path.dirname(naiveDestPath));
-    if (!existingNamesByYear.has(year)) {
-      existingNamesByYear.set(year, await loadExistingNames(path.join(dest, year)));
+    const period = path.basename(path.dirname(naiveDestPath));
+    if (!existingNamesByPeriod.has(period)) {
+      existingNamesByPeriod.set(period, await loadExistingNames(path.join(dest, period)));
     }
-    const names = existingNamesByYear.get(year);
+    const names = existingNamesByPeriod.get(period);
     const filename = path.basename(naiveDestPath);
     if (names.has(filename)) {
       alreadyOnDisk.push({ naiveDestPath, items });
@@ -223,16 +241,16 @@ async function main() {
   if (!dryRun) {
     console.log('\nCopying files...');
     for (const [naiveDestPath, items] of byNaiveDest.entries()) {
-      const year = path.basename(path.dirname(naiveDestPath));
-      const yearDir = path.join(dest, year);
-      await fsp.mkdir(yearDir, { recursive: true });
-      const names = existingNamesByYear.get(year); // already loaded above
+      const period = path.basename(path.dirname(naiveDestPath));
+      const periodDir = path.join(dest, period);
+      await fsp.mkdir(periodDir, { recursive: true });
+      const names = existingNamesByPeriod.get(period); // already loaded above
  
       for (const { filePath } of items) {
         const filename = path.basename(filePath);
         const finalName = nextAvailableName(filename, names);
         names.add(finalName);
-        const destPath = path.join(yearDir, finalName);
+        const destPath = path.join(periodDir, finalName);
         try {
           await fsp.copyFile(filePath, destPath, fs.constants.COPYFILE_EXCL);
           copied += 1;
@@ -254,7 +272,7 @@ async function main() {
     console.log(`Copied:                     ${copied}`);
     console.log(`Copy errors:                ${copyErrors}`);
   }
-  console.log(`Duplicate filenames within this run (same year + same name): ${collisions.length}`);
+  console.log(`Duplicate filenames within this run (same year+month folder + same name): ${collisions.length}`);
   console.log(`Filenames already present in the destination (e.g. prior run): ${alreadyOnDisk.length}`);
  
   if (unreadable.length > 0) {
