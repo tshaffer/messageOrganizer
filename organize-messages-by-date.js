@@ -19,7 +19,8 @@
  * Optional flags:
  *   --source=<path>      default: /Volumes/ShMedia/Archives/Messages/Attachments
  *   --dest=<path>        default: /Volumes/ShMedia/Archives/Messages/ByDate
- *   --concurrency=<n>    how many files to read metadata from in parallel (default 8)
+ *   --concurrency=<n>    how many files to read metadata/hashes from in
+ *                        parallel (default 8)
  *
  * Notes:
  *   - "Media files" = common image/video extensions (see MEDIA_EXTENSIONS
@@ -32,10 +33,15 @@
  *     the same photo attached in two different conversations) are only
  *     copied once. The extra copies are skipped and listed in the summary
  *     under "Duplicate content" - never renamed, never copied twice.
+ *   - Safe to re-run: before copying, each file's content hash is also
+ *     checked against whatever already exists in that year's destination
+ *     folder. Anything already archived (by content, not just by name) is
+ *     skipped and listed under "Already archived" - re-running never
+ *     creates redundant copies of something already there.
  *   - If two DIFFERENT files (different content) would still land on the
- *     same <year>/<filename>, the live run auto-renames with
- *     -1, -2, ... suffixes rather than overwriting or skipping anything.
- *     The dry run reports these separately, under "Duplicate filenames".
+ *     same <year>/<filename>, the live run auto-renames with -1, -2, ...
+ *     suffixes rather than overwriting or skipping anything. The dry run
+ *     reports these separately, under "Duplicate filenames".
  *   - Video capture dates occasionally come from a UTC timestamp in the
  *     file's metadata rather than local time, which can very rarely push a
  *     video shot right at a year boundary (e.g. Dec 31 late at night) into
@@ -159,7 +165,8 @@ async function getDateInfoForFile(exiftool, filePath) {
 }
 
 // SHA-256 of a file's raw bytes, used to detect byte-for-byte duplicates
-// (e.g. the same photo attached in two different conversations).
+// (e.g. the same photo attached in two different conversations, or a file
+// that was already copied to the destination in a previous run).
 function hashFile(filePath) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
@@ -170,15 +177,34 @@ function hashFile(filePath) {
   });
 }
 
-async function loadExistingNames(destDir) {
+// Reads a destination year-folder's current contents: the set of filenames
+// already there (for name-collision avoidance) and a hash->filename map of
+// their content (for detecting "this exact file is already archived").
+async function loadExistingDestInfo(destDir, concurrency) {
   const names = new Set();
+  const hashes = new Map(); // content hash -> existing filename
+  let entries;
   try {
-    const entries = await fsp.readdir(destDir);
-    for (const name of entries) names.add(name);
+    entries = await fsp.readdir(destDir, { withFileTypes: true });
   } catch (err) {
-    // directory doesn't exist yet - nothing to load
+    return { names, hashes }; // directory doesn't exist yet - nothing to load
   }
-  return names;
+  const files = [];
+  for (const entry of entries) {
+    if (entry.isFile()) {
+      names.add(entry.name);
+      files.push(entry.name);
+    }
+  }
+  await mapWithConcurrency(files, concurrency, async (name) => {
+    try {
+      const hash = await hashFile(path.join(destDir, name));
+      hashes.set(hash, name);
+    } catch (err) {
+      // unreadable existing file - it just won't match anything by hash
+    }
+  });
+  return { names, hashes };
 }
 
 function nextAvailableName(filename, existingNames) {
@@ -234,12 +260,12 @@ async function main() {
   const unreadable = dated.filter((d) => d.year === null);
   const usable = dated.filter((d) => d.year !== null);
 
-  // Content-based de-duplication: if two source files are byte-for-byte
-  // identical (e.g. the same photo attached in two different
-  // conversations), only one copy is placed in the destination. The copy
-  // with the alphabetically first source path is kept, for a
-  // deterministic result across dry-run and live-run; the rest are
-  // skipped and reported, never copied and never auto-renamed.
+  // Content-based de-duplication among THIS RUN's source files: if two
+  // source files are byte-for-byte identical (e.g. the same photo attached
+  // in two different conversations), only one copy is placed in the
+  // destination. The copy with the alphabetically first source path is
+  // kept, for a deterministic result across dry-run and live-run; the rest
+  // are skipped and reported, never copied and never auto-renamed.
   const byHash = new Map(); // hash -> [items]
   const noHash = []; // hashing failed - treat as unique, never skipped
   for (const item of usable) {
@@ -265,13 +291,35 @@ async function main() {
   }
   const duplicatesSkippedCount = duplicateGroups.reduce((n, g) => n + g.skipped.length, 0);
 
+  // Load each destination year folder that's actually relevant this run
+  // (both its filenames, for collision avoidance, and its files' content
+  // hashes, so a file already archived from a previous run is recognized
+  // and skipped rather than re-copied or redundantly renamed).
+  console.log('Checking destination folder(s) for existing content...');
+  const yearsInvolved = [...new Set(toPlace.map((item) => yearFolderName(item.year)))];
+  const destInfoByYear = new Map();
+  for (const year of yearsInvolved) {
+    destInfoByYear.set(year, await loadExistingDestInfo(path.join(dest, year), concurrency));
+  }
+
+  const alreadyArchived = []; // [{ item, existingName }]
+  const toCopy = [];
+  for (const item of toPlace) {
+    const info = destInfoByYear.get(yearFolderName(item.year));
+    if (item.hash && info.hashes.has(item.hash)) {
+      alreadyArchived.push({ item, existingName: info.hashes.get(item.hash) });
+    } else {
+      toCopy.push(item);
+    }
+  }
+
   // Group by intended (pre-suffix) destination path so we can spot
   // duplicate FILENAMES that would land in the same year folder.
-  // Content-identical duplicates were already removed above, so any
-  // collision found here is two DIFFERENT files that just happen to
-  // share a name.
+  // Content-identical duplicates (this run and already-archived) were
+  // already removed above, so any collision found here is two DIFFERENT
+  // files that just happen to share a name.
   const byNaiveDest = new Map(); // naiveDestPath -> [{filePath, dateSource}]
-  for (const item of toPlace) {
+  for (const item of toCopy) {
     const yearDir = path.join(dest, yearFolderName(item.year));
     const filename = path.basename(item.filePath);
     const naiveDestPath = path.join(yearDir, filename);
@@ -279,23 +327,6 @@ async function main() {
     byNaiveDest.get(naiveDestPath).push(item);
   }
   const collisions = [...byNaiveDest.entries()].filter(([, items]) => items.length > 1);
-
-  // Check which naive destination names already exist on disk (e.g. from a
-  // previous run of this script). Informational only - the live run
-  // handles these safely either way by auto-renaming.
-  const existingNamesByYear = new Map();
-  const alreadyOnDisk = [];
-  for (const [naiveDestPath, items] of byNaiveDest.entries()) {
-    const year = path.basename(path.dirname(naiveDestPath));
-    if (!existingNamesByYear.has(year)) {
-      existingNamesByYear.set(year, await loadExistingNames(path.join(dest, year)));
-    }
-    const names = existingNamesByYear.get(year);
-    const filename = path.basename(naiveDestPath);
-    if (names.has(filename)) {
-      alreadyOnDisk.push({ naiveDestPath, items });
-    }
-  }
 
   let copied = 0;
   let copyErrors = 0;
@@ -306,19 +337,31 @@ async function main() {
       const year = path.basename(path.dirname(naiveDestPath));
       const yearDir = path.join(dest, year);
       await fsp.mkdir(yearDir, { recursive: true });
-      const names = existingNamesByYear.get(year); // already loaded above
+      const names = destInfoByYear.get(year).names; // already loaded above
 
       for (const { filePath } of items) {
         const filename = path.basename(filePath);
-        const finalName = nextAvailableName(filename, names);
-        names.add(finalName);
-        const destPath = path.join(yearDir, finalName);
-        try {
-          await fsp.copyFile(filePath, destPath, fs.constants.COPYFILE_EXCL);
-          copied += 1;
-        } catch (err) {
-          console.error(`ERROR copying ${filePath} -> ${destPath}: ${err.message}`);
-          copyErrors += 1;
+        let finalName = nextAvailableName(filename, names);
+        // Defense in depth: even if our in-memory view of the destination
+        // is somehow stale, never overwrite - keep trying the next suffix
+        // until the filesystem itself confirms a free name.
+        for (let attempt = 0; ; attempt++) {
+          const destPath = path.join(yearDir, finalName);
+          try {
+            await fsp.copyFile(filePath, destPath, fs.constants.COPYFILE_EXCL);
+            names.add(finalName);
+            copied += 1;
+            break;
+          } catch (err) {
+            if (err.code === 'EEXIST' && attempt < 1000) {
+              names.add(finalName);
+              finalName = nextAvailableName(filename, names);
+              continue;
+            }
+            console.error(`ERROR copying ${filePath} -> ${destPath}: ${err.message}`);
+            copyErrors += 1;
+            break;
+          }
         }
       }
     }
@@ -329,14 +372,14 @@ async function main() {
   console.log(`Non-media files left alone:     ${nonMediaCount}`);
   console.log(`Unreadable (skipped):           ${unreadable.length}`);
   console.log(`Duplicate content found:        ${duplicateGroups.length} group(s), ${duplicatesSkippedCount} file(s) skipped`);
+  console.log(`Already archived (prior run):   ${alreadyArchived.length} file(s) skipped`);
   if (dryRun) {
-    console.log(`Would copy:                     ${toPlace.length}`);
+    console.log(`Would copy:                     ${toCopy.length}`);
   } else {
     console.log(`Copied:                         ${copied}`);
     console.log(`Copy errors:                    ${copyErrors}`);
   }
   console.log(`Duplicate filenames, different content: ${collisions.length}`);
-  console.log(`Filenames already present in the destination (e.g. prior run): ${alreadyOnDisk.length}`);
 
   if (unreadable.length > 0) {
     console.log('\nUnreadable files (no metadata date AND no usable filesystem date):');
@@ -344,10 +387,18 @@ async function main() {
   }
 
   if (duplicateGroups.length > 0) {
-    console.log('\nDuplicate content (identical file kept once; the rest are skipped, not copied):');
+    console.log('\nDuplicate content within this run (identical file kept once; the rest are skipped, not copied):');
     for (const { kept, skipped } of duplicateGroups) {
       console.log(`\n  KEEP: ${kept.filePath}`);
       for (const s of skipped) console.log(`  SKIP: ${s.filePath}`);
+    }
+  }
+
+  if (alreadyArchived.length > 0) {
+    console.log('\nAlready archived (same content already exists in the destination - skipped, not re-copied):');
+    for (const { item, existingName } of alreadyArchived) {
+      console.log(`  ${item.filePath}`);
+      console.log(`    already present as: ${path.join(dest, yearFolderName(item.year), existingName)}`);
     }
   }
 
@@ -362,13 +413,6 @@ async function main() {
       for (const { filePath, dateSource } of items) {
         console.log(`    <- ${filePath}  (date from ${dateSource})`);
       }
-    }
-  }
-
-  if (alreadyOnDisk.length > 0) {
-    console.log('\nFilenames that already exist in the destination folder (likely from a previous run):');
-    for (const { naiveDestPath, items } of alreadyOnDisk) {
-      console.log(`  ${naiveDestPath}  (${items.length} source file(s) this run)`);
     }
   }
 }
