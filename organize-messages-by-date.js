@@ -25,23 +25,32 @@
  *   - "Media files" = common image/video extensions (see MEDIA_EXTENSIONS
  *     below). Everything else under the source folder (PDFs, voice messages,
  *     contact cards, stickers, etc.) is left in place and just counted.
- *   - If two source files would land on the same <year><month>/<filename>,
- *     the live run auto-renames with -1, -2, ... suffixes rather than
- *     overwriting or skipping anything. The dry run reports these up front.
+ *   - AppleDouble sidecar files (e.g. "._IMG_1234.heic") and .DS_Store are
+ *     never treated as media, even though they can share a real file's
+ *     name/extension.
+ *   - Files that are byte-for-byte identical to another source file (e.g.
+ *     the same photo attached in two different conversations) are only
+ *     copied once. The extra copies are skipped and listed in the summary
+ *     under "Duplicate content" - never renamed, never copied twice.
+ *   - If two DIFFERENT files (different content) would still land on the
+ *     same <year><month>/<filename>, the live run auto-renames with
+ *     -1, -2, ... suffixes rather than overwriting or skipping anything.
+ *     The dry run reports these separately, under "Duplicate filenames".
  *   - Video capture dates occasionally come from a UTC timestamp in the
  *     file's metadata rather than local time, which can very rarely push a
  *     video shot right at a year boundary (e.g. Dec 31 late at night) into
  *     the neighboring year. This is a metadata limitation, not a bug in
  *     the script.
  */
- 
+
 'use strict';
- 
+
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
 const { ExifTool } = require('exiftool-vendored');
- 
+
 const IMAGE_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.png', '.heic', '.heif', '.gif', '.bmp', '.tiff', '.tif', '.webp',
 ]);
@@ -49,7 +58,7 @@ const VIDEO_EXTENSIONS = new Set([
   '.mov', '.mp4', '.m4v', '.avi', '.3gp', '.3g2', '.mpg', '.mpeg',
 ]);
 const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
- 
+
 // AppleDouble sidecar files (e.g. "._IMG_1234.heic") and Finder's .DS_Store
 // share a real file's name/extension but hold only Finder metadata, not
 // actual photo/video content. Never treat these as media.
@@ -57,7 +66,7 @@ function isJunkFile(filePath) {
   const name = path.basename(filePath);
   return name.startsWith('._') || name === '.DS_Store';
 }
- 
+
 function parseArgs(argv) {
   const args = {
     dryRun: false,
@@ -75,7 +84,7 @@ function parseArgs(argv) {
   }
   return args;
 }
- 
+
 async function walk(dir) {
   const out = [];
   let entries;
@@ -96,7 +105,7 @@ async function walk(dir) {
   }
   return out;
 }
- 
+
 // Runs `worker` over `items` with at most `limit` in flight at once.
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
@@ -111,12 +120,12 @@ async function mapWithConcurrency(items, limit, worker) {
   await Promise.all(runners);
   return results;
 }
- 
+
 // Folder name for a given year/month, e.g. (2026, 9) -> "202609".
 function periodFolderName(year, month) {
   return `${year}${String(month).padStart(2, '0')}`;
 }
- 
+
 async function getDateInfoForFile(exiftool, filePath) {
   try {
     const tags = await exiftool.read(filePath);
@@ -148,7 +157,19 @@ async function getDateInfoForFile(exiftool, filePath) {
     return { year: null, month: null, dateSource: `unreadable: ${err.message}` };
   }
 }
- 
+
+// SHA-256 of a file's raw bytes, used to detect byte-for-byte duplicates
+// (e.g. the same photo attached in two different conversations).
+function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
 async function loadExistingNames(destDir) {
   const names = new Set();
   try {
@@ -159,7 +180,7 @@ async function loadExistingNames(destDir) {
   }
   return names;
 }
- 
+
 function nextAvailableName(filename, existingNames) {
   const ext = path.extname(filename);
   const base = path.basename(filename, ext);
@@ -171,54 +192,86 @@ function nextAvailableName(filename, existingNames) {
   }
   return candidate;
 }
- 
+
 async function main() {
   const { dryRun, source, dest, concurrency } = parseArgs(process.argv.slice(2));
- 
+
   console.log(`Mode:        ${dryRun ? 'DRY RUN (no files will be copied)' : 'LIVE (files will be copied)'}`);
   console.log(`Source:      ${source}`);
   console.log(`Destination: ${dest}`);
   console.log(`Concurrency: ${concurrency}\n`);
- 
+
   const allFiles = await walk(source);
   console.log(`Found ${allFiles.length} total files under source.`);
- 
+
   const isMedia = (f) => !isJunkFile(f) && MEDIA_EXTENSIONS.has(path.extname(f).toLowerCase());
   const mediaFiles = allFiles.filter(isMedia);
   const nonMediaFiles = allFiles.filter((f) => !isMedia(f));
   const nonMediaCount = nonMediaFiles.length;
   console.log(`${mediaFiles.length} are images/videos; ${nonMediaCount} other files will be left in place.`);
- 
-  if (nonMediaCount > 0) {
-    const previewCount = Math.min(50, nonMediaCount);
-    console.log(`\nFirst ${previewCount} non-media file(s) (left in place, not copied):`);
-    for (const f of nonMediaFiles.slice(0, previewCount)) console.log(`  ${f}`);
-  }
+
   console.log('');
- 
+
   const exiftool = new ExifTool({
     taskTimeoutMillis: 15000,
     maxProcs: Math.max(1, Math.ceil(concurrency / 2)),
   });
- 
-  console.log('Reading capture dates (this is the slow part)...');
+
+  console.log('Reading capture dates and content hashes (this is the slow part)...');
   let readCount = 0;
   const dated = await mapWithConcurrency(mediaFiles, concurrency, async (filePath) => {
-    const result = await getDateInfoForFile(exiftool, filePath);
+    const [dateInfo, hash] = await Promise.all([
+      getDateInfoForFile(exiftool, filePath),
+      hashFile(filePath).catch(() => null),
+    ]);
     readCount += 1;
     if (readCount % 250 === 0) console.log(`  ...read ${readCount}/${mediaFiles.length}`);
-    return { filePath, ...result };
+    return { filePath, hash, ...dateInfo };
   });
- 
+
   await exiftool.end();
- 
+
   const unreadable = dated.filter((d) => d.year === null);
   const usable = dated.filter((d) => d.year !== null);
- 
-  // Group by intended (pre-suffix) destination path so we can spot
-  // duplicate filenames that would land in the same year+month folder.
-  const byNaiveDest = new Map(); // naiveDestPath -> [{filePath, dateSource}]
+
+  // Content-based de-duplication: if two source files are byte-for-byte
+  // identical (e.g. the same photo attached in two different
+  // conversations), only one copy is placed in the destination. The copy
+  // with the alphabetically first source path is kept, for a
+  // deterministic result across dry-run and live-run; the rest are
+  // skipped and reported, never copied and never auto-renamed.
+  const byHash = new Map(); // hash -> [items]
+  const noHash = []; // hashing failed - treat as unique, never skipped
   for (const item of usable) {
+    if (!item.hash) {
+      noHash.push(item);
+      continue;
+    }
+    if (!byHash.has(item.hash)) byHash.set(item.hash, []);
+    byHash.get(item.hash).push(item);
+  }
+
+  const toPlace = [...noHash];
+  const duplicateGroups = []; // [{ kept, skipped: [...] }]
+  for (const items of byHash.values()) {
+    if (items.length === 1) {
+      toPlace.push(items[0]);
+      continue;
+    }
+    const sorted = [...items].sort((a, b) => (a.filePath < b.filePath ? -1 : 1));
+    const [kept, ...skipped] = sorted;
+    toPlace.push(kept);
+    duplicateGroups.push({ kept, skipped });
+  }
+  const duplicatesSkippedCount = duplicateGroups.reduce((n, g) => n + g.skipped.length, 0);
+
+  // Group by intended (pre-suffix) destination path so we can spot
+  // duplicate FILENAMES that would land in the same year+month folder.
+  // Content-identical duplicates were already removed above, so any
+  // collision found here is two DIFFERENT files that just happen to
+  // share a name.
+  const byNaiveDest = new Map(); // naiveDestPath -> [{filePath, dateSource}]
+  for (const item of toPlace) {
     const periodDir = path.join(dest, periodFolderName(item.year, item.month));
     const filename = path.basename(item.filePath);
     const naiveDestPath = path.join(periodDir, filename);
@@ -226,7 +279,7 @@ async function main() {
     byNaiveDest.get(naiveDestPath).push(item);
   }
   const collisions = [...byNaiveDest.entries()].filter(([, items]) => items.length > 1);
- 
+
   // Check which naive destination names already exist on disk (e.g. from a
   // previous run of this script). Informational only - the live run
   // handles these safely either way by auto-renaming.
@@ -243,10 +296,10 @@ async function main() {
       alreadyOnDisk.push({ naiveDestPath, items });
     }
   }
- 
+
   let copied = 0;
   let copyErrors = 0;
- 
+
   if (!dryRun) {
     console.log('\nCopying files...');
     for (const [naiveDestPath, items] of byNaiveDest.entries()) {
@@ -254,7 +307,7 @@ async function main() {
       const periodDir = path.join(dest, period);
       await fsp.mkdir(periodDir, { recursive: true });
       const names = existingNamesByPeriod.get(period); // already loaded above
- 
+
       for (const { filePath } of items) {
         const filename = path.basename(filePath);
         const finalName = nextAvailableName(filename, names);
@@ -270,30 +323,39 @@ async function main() {
       }
     }
   }
- 
+
   console.log('\n--- Summary ---');
-  console.log(`Media files found:          ${mediaFiles.length}`);
-  console.log(`Non-media files left alone: ${nonMediaCount}`);
-  console.log(`Unreadable (skipped):       ${unreadable.length}`);
+  console.log(`Media files found:              ${mediaFiles.length}`);
+  console.log(`Non-media files left alone:     ${nonMediaCount}`);
+  console.log(`Unreadable (skipped):           ${unreadable.length}`);
+  console.log(`Duplicate content found:        ${duplicateGroups.length} group(s), ${duplicatesSkippedCount} file(s) skipped`);
   if (dryRun) {
-    console.log(`Would copy:                 ${usable.length}`);
+    console.log(`Would copy:                     ${toPlace.length}`);
   } else {
-    console.log(`Copied:                     ${copied}`);
-    console.log(`Copy errors:                ${copyErrors}`);
+    console.log(`Copied:                         ${copied}`);
+    console.log(`Copy errors:                    ${copyErrors}`);
   }
-  console.log(`Duplicate filenames within this run (same year+month folder + same name): ${collisions.length}`);
+  console.log(`Duplicate filenames, different content: ${collisions.length}`);
   console.log(`Filenames already present in the destination (e.g. prior run): ${alreadyOnDisk.length}`);
- 
+
   if (unreadable.length > 0) {
     console.log('\nUnreadable files (no metadata date AND no usable filesystem date):');
     for (const item of unreadable) console.log(`  ${item.filePath} - ${item.dateSource}`);
   }
- 
+
+  if (duplicateGroups.length > 0) {
+    console.log('\nDuplicate content (identical file kept once; the rest are skipped, not copied):');
+    for (const { kept, skipped } of duplicateGroups) {
+      console.log(`\n  KEEP: ${kept.filePath}`);
+      for (const s of skipped) console.log(`  SKIP: ${s.filePath}`);
+    }
+  }
+
   if (collisions.length > 0) {
     console.log(
       dryRun
-        ? '\nDuplicate destination filenames (the live run will auto-rename these with -1, -2, ... suffixes):'
-        : '\nDuplicate destination filenames (auto-renamed with -1, -2, ... suffixes during copy):'
+        ? '\nDuplicate destination filenames, different content (the live run will auto-rename these with -1, -2, ... suffixes):'
+        : '\nDuplicate destination filenames, different content (auto-renamed with -1, -2, ... suffixes during copy):'
     );
     for (const [naiveDestPath, items] of collisions) {
       console.log(`\n  ${naiveDestPath}`);
@@ -302,7 +364,7 @@ async function main() {
       }
     }
   }
- 
+
   if (alreadyOnDisk.length > 0) {
     console.log('\nFilenames that already exist in the destination folder (likely from a previous run):');
     for (const { naiveDestPath, items } of alreadyOnDisk) {
@@ -310,9 +372,8 @@ async function main() {
     }
   }
 }
- 
+
 main().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });
- 
