@@ -50,6 +50,14 @@ const VIDEO_EXTENSIONS = new Set([
 ]);
 const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
  
+// AppleDouble sidecar files (e.g. "._IMG_1234.heic") and Finder's .DS_Store
+// share a real file's name/extension but hold only Finder metadata, not
+// actual photo/video content. Never treat these as media.
+function isJunkFile(filePath) {
+  const name = path.basename(filePath);
+  return name.startsWith('._') || name === '.DS_Store';
+}
+ 
 function parseArgs(argv) {
   const args = {
     dryRun: false,
@@ -175,8 +183,9 @@ async function main() {
   const allFiles = await walk(source);
   console.log(`Found ${allFiles.length} total files under source.`);
  
-  const mediaFiles = allFiles.filter((f) => MEDIA_EXTENSIONS.has(path.extname(f).toLowerCase()));
-  const nonMediaFiles = allFiles.filter((f) => !MEDIA_EXTENSIONS.has(path.extname(f).toLowerCase()));
+  const isMedia = (f) => !isJunkFile(f) && MEDIA_EXTENSIONS.has(path.extname(f).toLowerCase());
+  const mediaFiles = allFiles.filter(isMedia);
+  const nonMediaFiles = allFiles.filter((f) => !isMedia(f));
   const nonMediaCount = nonMediaFiles.length;
   console.log(`${mediaFiles.length} are images/videos; ${nonMediaCount} other files will be left in place.`);
  
