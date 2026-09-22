@@ -5,9 +5,9 @@
  * Recursively scans a Messages Attachments folder, reads each media file's
  * actual capture date (from EXIF/QuickTime metadata via exiftool, falling
  * back to the file's filesystem date when no metadata date exists), and
- * copies it into <dest>/<year><month>/<filename> (e.g. 202609/IMG_1234.jpg
- * for a September 2026 photo). Originals are left untouched - this only
- * ever copies, never deletes or moves the source.
+ * copies it into <dest>/<year>/<filename> (e.g. 2026/IMG_1234.jpg for a
+ * 2026 photo). Originals are left untouched - this only ever copies,
+ * never deletes or moves the source.
  *
  * Setup (once, in whatever folder you keep this script):
  *   npm install exiftool-vendored
@@ -33,7 +33,7 @@
  *     copied once. The extra copies are skipped and listed in the summary
  *     under "Duplicate content" - never renamed, never copied twice.
  *   - If two DIFFERENT files (different content) would still land on the
- *     same <year><month>/<filename>, the live run auto-renames with
+ *     same <year>/<filename>, the live run auto-renames with
  *     -1, -2, ... suffixes rather than overwriting or skipping anything.
  *     The dry run reports these separately, under "Duplicate filenames".
  *   - Video capture dates occasionally come from a UTC timestamp in the
@@ -121,9 +121,9 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-// Folder name for a given year/month, e.g. (2026, 9) -> "202609".
-function periodFolderName(year, month) {
-  return `${year}${String(month).padStart(2, '0')}`;
+// Folder name for a given year, e.g. 2026 -> "2026".
+function yearFolderName(year) {
+  return `${year}`;
 }
 
 async function getDateInfoForFile(exiftool, filePath) {
@@ -266,15 +266,15 @@ async function main() {
   const duplicatesSkippedCount = duplicateGroups.reduce((n, g) => n + g.skipped.length, 0);
 
   // Group by intended (pre-suffix) destination path so we can spot
-  // duplicate FILENAMES that would land in the same year+month folder.
+  // duplicate FILENAMES that would land in the same year folder.
   // Content-identical duplicates were already removed above, so any
   // collision found here is two DIFFERENT files that just happen to
   // share a name.
   const byNaiveDest = new Map(); // naiveDestPath -> [{filePath, dateSource}]
   for (const item of toPlace) {
-    const periodDir = path.join(dest, periodFolderName(item.year, item.month));
+    const yearDir = path.join(dest, yearFolderName(item.year));
     const filename = path.basename(item.filePath);
-    const naiveDestPath = path.join(periodDir, filename);
+    const naiveDestPath = path.join(yearDir, filename);
     if (!byNaiveDest.has(naiveDestPath)) byNaiveDest.set(naiveDestPath, []);
     byNaiveDest.get(naiveDestPath).push(item);
   }
@@ -283,14 +283,14 @@ async function main() {
   // Check which naive destination names already exist on disk (e.g. from a
   // previous run of this script). Informational only - the live run
   // handles these safely either way by auto-renaming.
-  const existingNamesByPeriod = new Map();
+  const existingNamesByYear = new Map();
   const alreadyOnDisk = [];
   for (const [naiveDestPath, items] of byNaiveDest.entries()) {
-    const period = path.basename(path.dirname(naiveDestPath));
-    if (!existingNamesByPeriod.has(period)) {
-      existingNamesByPeriod.set(period, await loadExistingNames(path.join(dest, period)));
+    const year = path.basename(path.dirname(naiveDestPath));
+    if (!existingNamesByYear.has(year)) {
+      existingNamesByYear.set(year, await loadExistingNames(path.join(dest, year)));
     }
-    const names = existingNamesByPeriod.get(period);
+    const names = existingNamesByYear.get(year);
     const filename = path.basename(naiveDestPath);
     if (names.has(filename)) {
       alreadyOnDisk.push({ naiveDestPath, items });
@@ -303,16 +303,16 @@ async function main() {
   if (!dryRun) {
     console.log('\nCopying files...');
     for (const [naiveDestPath, items] of byNaiveDest.entries()) {
-      const period = path.basename(path.dirname(naiveDestPath));
-      const periodDir = path.join(dest, period);
-      await fsp.mkdir(periodDir, { recursive: true });
-      const names = existingNamesByPeriod.get(period); // already loaded above
+      const year = path.basename(path.dirname(naiveDestPath));
+      const yearDir = path.join(dest, year);
+      await fsp.mkdir(yearDir, { recursive: true });
+      const names = existingNamesByYear.get(year); // already loaded above
 
       for (const { filePath } of items) {
         const filename = path.basename(filePath);
         const finalName = nextAvailableName(filename, names);
         names.add(finalName);
-        const destPath = path.join(periodDir, finalName);
+        const destPath = path.join(yearDir, finalName);
         try {
           await fsp.copyFile(filePath, destPath, fs.constants.COPYFILE_EXCL);
           copied += 1;
